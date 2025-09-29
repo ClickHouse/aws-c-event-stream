@@ -13,15 +13,24 @@
 
 #include <stdio.h>
 
+AWS_PUSH_SANE_WARNING_LEVEL
+
 #define AWS_C_EVENT_STREAM_PACKAGE_ID 4
-/* max message size is 16MB */
-#define AWS_EVENT_STREAM_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
+/* Current service-side max is 24 MB, likely to increase in future.
+ * This is encoded on the wire in 4 bytes, and could technically be larger (up to INT32_MAX). */
+#define AWS_EVENT_STREAM_MAX_MESSAGE_SIZE (24 * 1024 * 1024)
 
-/* max header size is 128kb */
-#define AWS_EVENT_STREAM_MAX_HEADERS_SIZE (128 * 1024)
+/* Max total size for headers.
+ * This is encoded on the wire in 4 bytes, and could technically be larger (up to INT32_MAX). */
+#define AWS_EVENT_STREAM_MAX_HEADERS_SIZE (AWS_EVENT_STREAM_MAX_MESSAGE_SIZE)
 
-/* Max header name length is 127 bytes */
+/* Max header name length is 127 bytes.
+ * This is encoded on the wire in 1 byte, it cannot change. */
 #define AWS_EVENT_STREAM_HEADER_NAME_LEN_MAX (INT8_MAX)
+
+/* Max header value length is 32767 bytes.
+ * This is encoded on the wire in 2 bytes, it cannot change. */
+#define AWS_EVENT_STREAM_HEADER_VALUE_LEN_MAX (INT16_MAX)
 
 enum aws_event_stream_errors {
     AWS_ERROR_EVENT_STREAM_BUFFER_LENGTH_MISMATCH = AWS_ERROR_ENUM_BEGIN_RANGE(AWS_C_EVENT_STREAM_PACKAGE_ID),
@@ -60,9 +69,11 @@ struct aws_event_stream_message {
     struct aws_byte_buf message_buffer;
 };
 
-#define AWS_EVENT_STREAM_PRELUDE_LENGTH (uint32_t)(sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t))
+/* Prelude (12-bytes) = Total Byte Length (4-bytes) + Headers Byte Length (4-bytes) + Prelude CRC (4-bytes) */
+#define AWS_EVENT_STREAM_PRELUDE_LENGTH (uint32_t)(12)
 
-#define AWS_EVENT_STREAM_TRAILER_LENGTH (uint32_t)(sizeof(uint32_t))
+/* Trailer (4-bytes) = Message CRC (4-bytes) */
+#define AWS_EVENT_STREAM_TRAILER_LENGTH (uint32_t)(4)
 
 enum aws_event_stream_header_value_type {
     AWS_EVENT_STREAM_HEADER_BOOL_TRUE = 0,
@@ -78,14 +89,13 @@ enum aws_event_stream_header_value_type {
     AWS_EVENT_STREAM_HEADER_UUID
 };
 
-static const uint16_t UUID_LEN = 16U;
 struct aws_event_stream_header_value_pair {
     uint8_t header_name_len;
-    char header_name[INT8_MAX];
+    char header_name[AWS_EVENT_STREAM_HEADER_NAME_LEN_MAX];
     enum aws_event_stream_header_value_type header_value_type;
     union {
-        uint8_t *variable_len_val;
-        uint8_t static_val[16];
+        uint8_t *variable_len_val; /* for variable-size types (STRING, BYTE_BUF)*/
+        uint8_t static_val[16];    /* largest fixed-size types are 16 bytes (INT64, UUID, TIMESTAMP) */
     } header_value;
 
     uint16_t header_value_len;
@@ -130,6 +140,15 @@ typedef void(aws_event_stream_header_received_fn)(
     void *user_data);
 
 /**
+ * Called by aws_aws_event_stream_streaming_decoder when a message decoding is complete
+ * and crc is verified.
+ */
+typedef void(aws_event_stream_on_complete_fn)(
+    struct aws_event_stream_streaming_decoder *decoder,
+    uint32_t message_crc,
+    void *user_data);
+
+/**
  * Called by aws_aws_event_stream_streaming_decoder when an error is encountered. The decoder is not in a good state for
  * usage after this callback.
  */
@@ -153,10 +172,48 @@ struct aws_event_stream_streaming_decoder {
     aws_event_stream_process_on_payload_segment_fn *on_payload;
     aws_event_stream_prelude_received_fn *on_prelude;
     aws_event_stream_header_received_fn *on_header;
+    aws_event_stream_on_complete_fn *on_complete;
     aws_event_stream_on_error_fn *on_error;
     void *user_context;
 };
 
+struct aws_event_stream_streaming_decoder_options {
+    /**
+     * (Required)
+     * Invoked repeatedly as payload segment are received.
+     * See `aws_event_stream_process_on_payload_segment_fn`.
+     */
+    aws_event_stream_process_on_payload_segment_fn *on_payload_segment;
+    /**
+     * (Required)
+     * Invoked when when a new message has arrived. The prelude will contain metadata about the message.
+     * See `aws_event_stream_prelude_received_fn`.
+     */
+    aws_event_stream_prelude_received_fn *on_prelude;
+    /**
+     * (Required)
+     * Invoked repeatedly as headers are received.
+     * See `aws_event_stream_header_received_fn`.
+     */
+    aws_event_stream_header_received_fn *on_header;
+    /**
+     * (Optional)
+     * Invoked if a message is decoded successfully.
+     * See `aws_event_stream_on_complete_fn`.
+     */
+    aws_event_stream_on_complete_fn *on_complete;
+    /**
+     * (Required)
+     * Invoked when an error is encountered. The decoder is not in a good state for usage after this callback.
+     * See `aws_event_stream_on_error_fn`.
+     */
+    aws_event_stream_on_error_fn *on_error;
+    /**
+     * (Optional)
+     * user_data passed to callbacks.
+     */
+    void *user_data;
+};
 AWS_EXTERN_C_BEGIN
 
 /**
@@ -167,8 +224,8 @@ AWS_EXTERN_C_BEGIN
 AWS_EVENT_STREAM_API int aws_event_stream_message_init(
     struct aws_event_stream_message *message,
     struct aws_allocator *alloc,
-    struct aws_array_list *headers,
-    struct aws_byte_buf *payload);
+    const struct aws_array_list *headers,
+    const struct aws_byte_buf *payload);
 
 /**
  * Zero allocation, Zero copy. The message will simply wrap the buffer. The message functions are only useful as long as
@@ -275,7 +332,19 @@ AWS_EVENT_STREAM_API int aws_event_stream_read_headers_from_buffer(
     struct aws_array_list *headers,
     const uint8_t *buffer,
     size_t headers_len);
+
 /**
+ * Initialize a streaming decoder for messages with callbacks for usage
+ * and an optional user context pointer.
+ */
+AWS_EVENT_STREAM_API
+void aws_event_stream_streaming_decoder_init_from_options(
+    struct aws_event_stream_streaming_decoder *decoder,
+    struct aws_allocator *allocator,
+    const struct aws_event_stream_streaming_decoder_options *options);
+
+/**
+ * Deprecated. Use aws_event_stream_streaming_decoder_init_from_options instead.
  * Initialize a streaming decoder for messages with callbacks for usage and an optional user context pointer.
  */
 AWS_EVENT_STREAM_API void aws_event_stream_streaming_decoder_init(
@@ -402,6 +471,133 @@ AWS_EVENT_STREAM_API int aws_event_stream_add_uuid_header(
     const uint8_t *value);
 
 /**
+ * Adds a generic header to the list of headers.
+ * Makes a copy of the underlaying data.
+ */
+AWS_EVENT_STREAM_API int aws_event_stream_add_header(
+    struct aws_array_list *headers,
+    const struct aws_event_stream_header_value_pair *header);
+
+/* Cursor-based header APIs */
+
+/**
+ * Adds a boolean-valued header to a header list
+ *
+ * @param headers header list to add to
+ * @param name name of the header to add
+ * @param value value of the header to add
+ * @return AWS_OP_SUCCESS on success, AWS_OP_ERR on failure
+ */
+AWS_EVENT_STREAM_API int aws_event_stream_add_bool_header_by_cursor(
+    struct aws_array_list *headers,
+    struct aws_byte_cursor name,
+    bool value);
+
+/**
+ * Adds a byte-valued header to a header list
+ *
+ * @param headers header list to add to
+ * @param name name of the header to add
+ * @param value value of the header to add
+ * @return AWS_OP_SUCCESS on success, AWS_OP_ERR on failure
+ */
+AWS_EVENT_STREAM_API int aws_event_stream_add_byte_header_by_cursor(
+    struct aws_array_list *headers,
+    struct aws_byte_cursor name,
+    int8_t value);
+
+/**
+ * Adds a int16-valued header to a header list
+ *
+ * @param headers header list to add to
+ * @param name name of the header to add
+ * @param value value of the header to add
+ * @return AWS_OP_SUCCESS on success, AWS_OP_ERR on failure
+ */
+AWS_EVENT_STREAM_API int aws_event_stream_add_int16_header_by_cursor(
+    struct aws_array_list *headers,
+    struct aws_byte_cursor name,
+    int16_t value);
+
+/**
+ * Adds a int32-valued header to a header list
+ *
+ * @param headers header list to add to
+ * @param name name of the header to add
+ * @param value value of the header to add
+ * @return AWS_OP_SUCCESS on success, AWS_OP_ERR on failure
+ */
+AWS_EVENT_STREAM_API int aws_event_stream_add_int32_header_by_cursor(
+    struct aws_array_list *headers,
+    struct aws_byte_cursor name,
+    int32_t value);
+
+/**
+ * Adds a int64-valued header to a header list
+ *
+ * @param headers header list to add to
+ * @param name name of the header to add
+ * @param value value of the header to add
+ * @return AWS_OP_SUCCESS on success, AWS_OP_ERR on failure
+ */
+AWS_EVENT_STREAM_API int aws_event_stream_add_int64_header_by_cursor(
+    struct aws_array_list *headers,
+    struct aws_byte_cursor name,
+    int64_t value);
+
+/**
+ * Adds a string-valued header to a header list
+ *
+ * @param headers header list to add to
+ * @param name name of the header to add
+ * @param value value of the header to add
+ * @return AWS_OP_SUCCESS on success, AWS_OP_ERR on failure
+ */
+AWS_EVENT_STREAM_API int aws_event_stream_add_string_header_by_cursor(
+    struct aws_array_list *headers,
+    struct aws_byte_cursor name,
+    struct aws_byte_cursor value);
+
+/**
+ * Adds a byte_buf-valued header to a header list
+ *
+ * @param headers header list to add to
+ * @param name name of the header to add
+ * @param value value of the header to add
+ * @return AWS_OP_SUCCESS on success, AWS_OP_ERR on failure
+ */
+AWS_EVENT_STREAM_API int aws_event_stream_add_byte_buf_header_by_cursor(
+    struct aws_array_list *headers,
+    struct aws_byte_cursor name,
+    struct aws_byte_cursor value);
+
+/**
+ * Adds a timestamp-valued header to a header list
+ *
+ * @param headers header list to add to
+ * @param name name of the header to add
+ * @param value value of the header to add
+ * @return AWS_OP_SUCCESS on success, AWS_OP_ERR on failure
+ */
+AWS_EVENT_STREAM_API int aws_event_stream_add_timestamp_header_by_cursor(
+    struct aws_array_list *headers,
+    struct aws_byte_cursor name,
+    int64_t value);
+
+/**
+ * Adds a uuid-valued header to a header list
+ *
+ * @param headers header list to add to
+ * @param name name of the header to add
+ * @param value value of the header to add
+ * @return AWS_OP_SUCCESS on success, AWS_OP_ERR on failure
+ */
+AWS_EVENT_STREAM_API int aws_event_stream_add_uuid_header_by_cursor(
+    struct aws_array_list *headers,
+    struct aws_byte_cursor name,
+    struct aws_byte_cursor value);
+
+/**
  * Returns the header name. Note: this value is not null terminated
  */
 AWS_EVENT_STREAM_API struct aws_byte_buf aws_event_stream_header_name(
@@ -483,5 +679,6 @@ AWS_EVENT_STREAM_API void aws_event_stream_library_init(struct aws_allocator *al
 AWS_EVENT_STREAM_API void aws_event_stream_library_clean_up(void);
 
 AWS_EXTERN_C_END
+AWS_POP_SANE_WARNING_LEVEL
 
 #endif /* AWS_EVENT_STREAM_H_ */
